@@ -1,0 +1,3 @@
+[workspace]
+members = ["ktr_lib", "ktr_agent"]
+resolver = "2"
