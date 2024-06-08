@@ -58,13 +58,19 @@ fn main() -> Result<()> {
     let icmp = TransportChannelType::Layer3(ip::IpNextHeaderProtocols::Icmp);
     let (mut tx, mut rx) = transport_channel(2048, icmp)?;
 
-    send_echo(&mut tx, 1, Ipv4Addr::new(200, 147, 35, 149), 10, 1)?;
+    for ttl in 0..32 {
+        send_echo(&mut tx, 1, Ipv4Addr::new(200, 147, 35, 149), ttl, 42)?;
+    }
 
     let mut rx_iter = ipv4_packet_iter(&mut rx);
-    let (res_ip_pkg, res_ip_addr) = rx_iter.next()?;
-    let res_icmp_pkg = icmp::IcmpPacket::new(res_ip_pkg.payload()).context("Fail to decode");
+    loop {
+        let (res_ip_pkg, res_ip_addr) = rx_iter.next()?;
+        let res_icmp_pkg = icmp::IcmpPacket::new(res_ip_pkg.payload()).context("Fail to decode")?;
 
-    println!("{res_ip_addr} -> {res_icmp_pkg:?}");
+        if res_icmp_pkg.get_icmp_type() != icmp::IcmpType(11) {
+            continue;
+        }
 
-    Ok(())
+        println!("{res_ip_addr} -> {res_icmp_pkg:?}");
+    }
 }
