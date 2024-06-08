@@ -1,3 +1,8 @@
-[workspace]
-members = ["ktr_lib", "ktr_agent"]
-resolver = "2"
+[package]
+name = "tracer"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+anyhow = "1.0.86"
+pnet = "0.35.0"
