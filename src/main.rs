@@ -1,4 +1,4 @@
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, time::Duration};
 
 use pnet::{
     packet::{icmp, ip, ipv4, Packet},
@@ -55,22 +55,41 @@ pub fn send_echo(
 }
 
 fn main() -> Result<()> {
+    traceroute()
+}
+
+fn traceroute() -> Result<()> {
     let icmp = TransportChannelType::Layer3(ip::IpNextHeaderProtocols::Icmp);
     let (mut tx, mut rx) = transport_channel(2048, icmp)?;
+    let mut send_echo = |ttl| send_echo(&mut tx, 1, Ipv4Addr::new(200, 147, 35, 149), ttl, 42);
 
-    for ttl in 0..32 {
-        send_echo(&mut tx, 1, Ipv4Addr::new(200, 147, 35, 149), ttl, 42)?;
-    }
-
+    let mut last_ttl = 1;
+    send_echo(last_ttl)?;
     let mut rx_iter = ipv4_packet_iter(&mut rx);
+
     loop {
-        let (res_ip_pkg, res_ip_addr) = rx_iter.next()?;
-        let res_icmp_pkg = icmp::IcmpPacket::new(res_ip_pkg.payload()).context("Fail to decode")?;
+        let (res_ip_packet, res_ip_addr) = match rx_iter.next_with_timeout(Duration::new(1, 0))? {
+            Some(r) => r,
+            _ => {
+                println!("hop {last_ttl}:\t*");
+                last_ttl += 1;
+                send_echo(last_ttl)?;
+                continue;
+            }
+        };
 
+        let res_icmp_pkg =
+            icmp::IcmpPacket::new(res_ip_packet.payload()).context("Failed to decode")?;
+
+        println!("hop {last_ttl}:\t{res_ip_addr}");
         if res_icmp_pkg.get_icmp_type() != icmp::IcmpType(11) {
-            continue;
+            // todo: check source ip to make sure we are really done
+            println!("DONE");
+            break;
         }
-
-        println!("{res_ip_addr} -> {res_icmp_pkg:?}");
+        last_ttl += 1;
+        send_echo(last_ttl)?;
     }
+
+    Ok(())
 }

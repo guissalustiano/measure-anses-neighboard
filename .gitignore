@@ -1,2 +1,6 @@
 /target
 .env
+.envrc
+.direnv
+flake.nix
+flake.lock
