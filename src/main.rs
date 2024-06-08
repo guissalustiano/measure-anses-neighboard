@@ -2,10 +2,7 @@ use std::net::Ipv4Addr;
 
 use pnet::{
     packet::{icmp, ip, ipv4, Packet},
-    transport::{
-        icmp_packet_iter, transport_channel, TransportChannelType, TransportProtocol,
-        TransportSender,
-    },
+    transport::{ipv4_packet_iter, transport_channel, TransportChannelType, TransportSender},
     util::checksum,
 };
 
@@ -48,8 +45,7 @@ pub fn send_echo(
     icmp_packet.set_identifier(id);
     icmp_packet.set_sequence_number(sequence_number);
 
-    let icmp_checksum = checksum(icmp_packet.packet(), 1);
-    icmp_packet.set_checksum(icmp_checksum);
+    icmp_packet.set_checksum(checksum(icmp_packet.packet(), 1));
 
     ip_packet.set_payload(icmp_packet.packet());
 
@@ -59,16 +55,16 @@ pub fn send_echo(
 }
 
 fn main() -> Result<()> {
-    let icmp =
-        TransportChannelType::Layer4(TransportProtocol::Ipv4(ip::IpNextHeaderProtocols::Icmp));
+    let icmp = TransportChannelType::Layer3(ip::IpNextHeaderProtocols::Icmp);
     let (mut tx, mut rx) = transport_channel(2048, icmp)?;
 
-    send_echo(&mut tx, 1, Ipv4Addr::new(200, 147, 35, 149), 1, 1)?;
+    send_echo(&mut tx, 1, Ipv4Addr::new(200, 147, 35, 149), 10, 1)?;
 
-    let mut rx_iter = icmp_packet_iter(&mut rx);
-    let (res_pkg, res_ip) = rx_iter.next()?;
+    let mut rx_iter = ipv4_packet_iter(&mut rx);
+    let (res_ip_pkg, res_ip_addr) = rx_iter.next()?;
+    let res_icmp_pkg = icmp::IcmpPacket::new(res_ip_pkg.payload()).context("Fail to decode");
 
-    println!("{res_ip:?} -> {res_pkg:?}");
+    println!("{res_ip_addr} -> {res_icmp_pkg:?}");
 
     Ok(())
 }
