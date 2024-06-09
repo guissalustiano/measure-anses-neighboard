@@ -79,7 +79,6 @@ struct TraceRoute {
 
 impl Display for TraceRoute {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        //f.write_fmt("[{}] {}", self.target, self.hops);
         f.write_fmt(format_args!("[{}] {{ ", self.target))?;
         for h in &self.hops {
             match h {
@@ -153,6 +152,7 @@ impl Tracer {
                 .expect("not empty");
             let elapsed = Instant::now().duration_since(oldest_time);
             let wait_time = self.config.retry_duration.checked_sub(elapsed);
+
             if let Some((packet, _)) = wait_time
                 .map(|t| packet_iter.next_with_timeout(t).ok())
                 .flatten()
@@ -170,17 +170,23 @@ impl Tracer {
                         let packet = ipv4::Ipv4Packet::new(packet.payload()).context("valid")?;
 
                         let id = packet.get_identification();
-                        for trace in &mut self.outgoing {
-                            if id == trace.hopinfo.id {
-                                println!(
-                                    "[{}] hop\t{}:\t{} (ID={id})",
-                                    trace.target,
-                                    1 + trace.hops.len(),
-                                    received_ip_addr,
-                                );
-                                trace.hops.push(Some(received_ip_addr));
-                                self.last_sent_id += 1;
+                        if let Some((idx, trace)) = self
+                            .outgoing
+                            .iter_mut()
+                            .enumerate()
+                            .find(|(_, trace)| trace.hopinfo.id == id)
+                        {
+                            println!(
+                                "[{}] hop\t{}:\t{} (ID={id})",
+                                trace.target,
+                                1 + trace.hops.len(),
+                                received_ip_addr,
+                            );
 
+                            trace.hops.push(Some(received_ip_addr));
+
+                            if (trace.hops.len() as u8) < self.config.max_hops - 1 {
+                                self.last_sent_id += 1;
                                 send_echo(
                                     &mut self.ts,
                                     1,
@@ -193,9 +199,12 @@ impl Tracer {
                                     retry: 0,
                                     id: self.last_sent_id,
                                 };
-                                break;
+                            } else {
+                                let done = self.outgoing.swap_remove(idx);
+                                println!("[{}] MAX_HOPS_REACHED {:?}", done.target, done.hops);
+                                self.done.push(done)
                             }
-                        }
+                        };
                     }
                     icmp::IcmpTypes::EchoReply => {
                         if let Some((idx, _)) = self
@@ -210,7 +219,6 @@ impl Tracer {
                             self.done.push(done);
                         }
                     }
-                    //icmp::IcmpTypes::TimeExceeded => continue,
                     //icmp::IcmpTypes::DestinationUnreachable => continue,
                     _ => {}
                 }
@@ -253,6 +261,7 @@ impl Tracer {
                 } else {
                     let oldest = self.outgoing.swap_remove(oldest_idx);
                     println!("[{}] MAX_HOPS_REACHED {:?}", oldest.target, oldest.hops);
+                    self.done.push(oldest)
                 }
             }
         }
