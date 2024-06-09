@@ -1,8 +1,19 @@
-use std::{net::Ipv4Addr, time::Duration};
+use std::{
+    fmt::{Display, Write},
+    net::Ipv4Addr,
+    time::{Duration, Instant},
+};
 
 use pnet::{
-    packet::{icmp, ip, ipv4, Packet},
-    transport::{ipv4_packet_iter, transport_channel, TransportChannelType, TransportSender},
+    packet::{
+        icmp,
+        ip::{self, IpNextHeaderProtocols},
+        ipv4, Packet,
+    },
+    transport::{
+        ipv4_packet_iter, transport_channel, TransportChannelType, TransportReceiver,
+        TransportSender,
+    },
     util::checksum,
 };
 
@@ -54,14 +65,233 @@ pub fn send_echo(
     Ok(())
 }
 
-fn main() -> Result<()> {
-    traceroute()
+struct HopInfo {
+    since: Instant,
+    retry: usize,
+    id: u16,
 }
 
-fn traceroute() -> Result<()> {
+struct TraceRoute {
+    target: Ipv4Addr,
+    hops: Vec<Option<Ipv4Addr>>,
+    hopinfo: HopInfo,
+}
+
+impl Display for TraceRoute {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        //f.write_fmt("[{}] {}", self.target, self.hops);
+        f.write_fmt(format_args!("[{}] {{ ", self.target))?;
+        for h in &self.hops {
+            match h {
+                Some(ip) => f.write_fmt(format_args!(" -> {}", &ip.to_string()))?,
+                None => f.write_str(" -> *")?,
+            };
+        }
+        f.write_char('}')?;
+        Ok(())
+    }
+}
+
+struct TraceConfig {
+    max_hops: u8,
+    max_traces_outgoing: usize,
+    retry_duration: Duration,
+    retry_times: usize,
+}
+
+struct Tracer {
+    config: TraceConfig,
+    todo: Vec<Ipv4Addr>,
+    outgoing: Vec<TraceRoute>,
+    done: Vec<TraceRoute>,
+    ts: TransportSender,
+    tr: TransportReceiver,
+    last_sent_id: u16,
+}
+
+impl Tracer {
+    fn new(todo: Vec<Ipv4Addr>, config: TraceConfig) -> Result<Self> {
+        let icmp = TransportChannelType::Layer3(ip::IpNextHeaderProtocols::Icmp);
+        let (ts, tr) = transport_channel(2048, icmp)?;
+
+        Ok(Self {
+            config,
+            todo,
+            outgoing: vec![],
+            done: vec![],
+            ts,
+            tr,
+            last_sent_id: 0,
+        })
+    }
+
+    fn trace_all(&mut self) -> Result<()> {
+        let mut packet_iter = ipv4_packet_iter(&mut self.tr);
+        while !(self.todo.is_empty() && self.outgoing.is_empty()) {
+            // send echos until max_outgoing
+            while !self.todo.is_empty() && self.outgoing.len() < self.config.max_traces_outgoing {
+                let next_trace_target = self.todo.pop().expect("not empty");
+                self.last_sent_id += 1;
+                send_echo(&mut self.ts, 1, next_trace_target, 1, self.last_sent_id)?;
+                self.outgoing.push(TraceRoute {
+                    target: next_trace_target,
+                    hops: vec![],
+                    hopinfo: HopInfo {
+                        retry: 0,
+                        since: Instant::now(),
+                        id: self.last_sent_id,
+                    },
+                })
+            }
+
+            let (oldest_time, oldest_idx) = self
+                .outgoing
+                .iter()
+                .enumerate()
+                .map(|(idx, info)| (info.hopinfo.since, idx))
+                .min()
+                .expect("not empty");
+            let elapsed = Instant::now().duration_since(oldest_time);
+            let wait_time = self.config.retry_duration.checked_sub(elapsed);
+            if let Some((packet, _)) = wait_time
+                .map(|t| packet_iter.next_with_timeout(t).ok())
+                .flatten()
+                .flatten()
+            {
+                let received_ip_addr = packet.get_source();
+                if packet.get_next_level_protocol() != IpNextHeaderProtocols::Icmp {
+                    continue;
+                }
+                let packet = icmp::IcmpPacket::new(packet.payload()).context("Failed to decode")?;
+                match packet.get_icmp_type() {
+                    icmp::IcmpTypes::TimeExceeded => {
+                        let packet = icmp::time_exceeded::TimeExceededPacket::new(packet.packet())
+                            .context("Failed to decode")?;
+                        let packet = ipv4::Ipv4Packet::new(packet.payload()).context("valid")?;
+
+                        let id = packet.get_identification();
+                        for trace in &mut self.outgoing {
+                            if id == trace.hopinfo.id {
+                                println!(
+                                    "[{}] hop\t{}:\t{} (ID={id})",
+                                    trace.target,
+                                    1 + trace.hops.len(),
+                                    received_ip_addr,
+                                );
+                                trace.hops.push(Some(received_ip_addr));
+                                self.last_sent_id += 1;
+
+                                send_echo(
+                                    &mut self.ts,
+                                    1,
+                                    trace.target,
+                                    1 + trace.hops.len() as u8,
+                                    self.last_sent_id,
+                                )?;
+                                trace.hopinfo = HopInfo {
+                                    since: Instant::now(),
+                                    retry: 0,
+                                    id: self.last_sent_id,
+                                };
+                                break;
+                            }
+                        }
+                    }
+                    icmp::IcmpTypes::EchoReply => {
+                        if let Some((idx, _)) = self
+                            .outgoing
+                            .iter()
+                            .enumerate()
+                            .find(|(_, trace)| trace.target == received_ip_addr)
+                        {
+                            let mut done = self.outgoing.swap_remove(idx);
+                            done.hops.push(Some(received_ip_addr));
+                            println!("[{}]: DONE -> {:?}", done.target, done.hops);
+                            self.done.push(done);
+                        }
+                    }
+                    //icmp::IcmpTypes::TimeExceeded => continue,
+                    //icmp::IcmpTypes::DestinationUnreachable => continue,
+                    _ => {}
+                }
+            } else {
+                let oldest = &mut self.outgoing[oldest_idx];
+                if oldest.hopinfo.retry < self.config.retry_times {
+                    send_echo(
+                        &mut self.ts,
+                        1,
+                        oldest.target,
+                        1 + oldest.hops.len() as u8,
+                        oldest.hopinfo.id,
+                    )?;
+                    oldest.hopinfo.retry += 1;
+                    oldest.hopinfo.since = Instant::now();
+                    println!(
+                        "[{}] hop\t{}:\t RETRY {}",
+                        oldest.target,
+                        1 + oldest.hops.len(),
+                        oldest.hopinfo.retry
+                    );
+                } else if (oldest.hops.len() as u8) < self.config.max_hops - 1 {
+                    println!("[{}] hop\t{}:\t *", oldest.target, 1 + oldest.hops.len());
+
+                    oldest.hops.push(None);
+                    self.last_sent_id += 1;
+
+                    send_echo(
+                        &mut self.ts,
+                        1,
+                        oldest.target,
+                        oldest.hops.len() as u8,
+                        self.last_sent_id,
+                    )?;
+                    oldest.hopinfo = HopInfo {
+                        since: Instant::now(),
+                        retry: 0,
+                        id: self.last_sent_id,
+                    }
+                } else {
+                    let oldest = self.outgoing.swap_remove(oldest_idx);
+                    println!("[{}] MAX_HOPS_REACHED {:?}", oldest.target, oldest.hops);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+fn main() -> Result<()> {
+    let ips = vec![
+        Ipv4Addr::new(142, 250, 179, 195),
+        Ipv4Addr::new(200, 147, 35, 149),
+        Ipv4Addr::new(142, 251, 36, 3),
+        Ipv4Addr::new(142, 250, 179, 163),
+    ];
+    let mut tracer = Tracer::new(
+        ips,
+        TraceConfig {
+            max_hops: 32,
+            max_traces_outgoing: 2,
+            retry_times: 2,
+            retry_duration: Duration::new(1, 0),
+        },
+    )?;
+
+    tracer.trace_all()?;
+
+    println!("ROUTES:");
+    for route in tracer.done {
+        println!("{route}");
+    }
+    Ok(())
+}
+
+fn _old_traceroute(dest_ip: Ipv4Addr) -> Result<()> {
     let icmp = TransportChannelType::Layer3(ip::IpNextHeaderProtocols::Icmp);
-    let (mut tx, mut rx) = transport_channel(2048, icmp)?;
-    let mut send_echo = |ttl| send_echo(&mut tx, 1, Ipv4Addr::new(200, 147, 35, 149), ttl, 42);
+    let (mut tx, _) = transport_channel(2048, icmp)?;
+    let (_, mut rx) = transport_channel(2048, icmp)?;
+
+    let mut send_echo = |ttl| send_echo(&mut tx, 1, dest_ip, ttl, 42);
 
     let mut last_ttl = 1;
     send_echo(last_ttl)?;
@@ -84,7 +314,7 @@ fn traceroute() -> Result<()> {
         println!("hop {last_ttl}:\t{res_ip_addr}");
         if res_icmp_pkg.get_icmp_type() != icmp::IcmpType(11) {
             // todo: check source ip to make sure we are really done
-            println!("DONE");
+            println!("DONE {}", (res_ip_addr == dest_ip));
             break;
         }
         last_ttl += 1;
