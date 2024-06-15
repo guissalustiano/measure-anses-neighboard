@@ -5,3 +5,4 @@
 flake.nix
 flake.lock
 ips.csv
+output.txt
