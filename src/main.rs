@@ -63,7 +63,7 @@ fn ips_from_csv(path: &str, num: usize) -> Result<Vec<Ipv4Addr>> {
     Ok(ip_scores
         .iter()
         .rev()
-        .take(num * 1_000_000)
+        .take(1_000_000)
         .map(|i| i.1)
         .choose_multiple(&mut rng, num))
 }
