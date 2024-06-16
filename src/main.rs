@@ -1,48 +1,41 @@
-mod echo;
-mod tracer;
-
-use crate::tracer::TraceConfig;
 use anyhow::Result;
+use pnet::{
+    packet::{
+        icmp::{IcmpPacket, IcmpType},
+        ip::{self, IpNextHeaderProtocols},
+        ipv4, Packet,
+    },
+    transport::{self, ipv4_packet_iter, transport_channel, TransportChannelType},
+};
 use rand::{seq::IteratorRandom, thread_rng};
 use std::{
     env,
-    fs::{read_to_string, File},
-    io::Write,
+    fs::read_to_string,
     net::Ipv4Addr,
     str::FromStr,
-    sync::mpsc::channel,
+    sync::mpsc::{self},
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
+
+fn icmp_transport_channel(
+    buffer_size: usize,
+) -> Result<(transport::TransportSender, transport::TransportReceiver), std::io::Error> {
+    transport_channel(
+        buffer_size,
+        TransportChannelType::Layer3(ip::IpNextHeaderProtocols::Icmp),
+    )
+}
 
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let ips = ips_from_csv(&args[1], 100)?;
-    let ips_len = ips.len();
 
-    let mut tracer = tracer::Tracer::new(
-        ips,
-        TraceConfig {
-            max_hops: 30,
-            max_traces_outgoing: 4,
-            retry_times: 0,
-            timeout_duration: Duration::new(1, 0),
-        },
-    )?;
-    let mut output = File::create("output.txt")?;
-    thread::scope(move |s| -> Result<()> {
-        let (sender, receiver) = channel();
+    let (transport_tx, transport_rx) = icmp_transport_channel(2048).unwrap();
+    let (receiver_tx, receiver_rx) = mpsc::channel();
+    Receiver::spawn(transport_rx, receiver_tx);
 
-        s.spawn(move || {
-            tracer.trace_all(sender);
-        });
-
-        for (idx, traceroute) in receiver.iter().enumerate() {
-            println!("[{}/{}]{traceroute}", 1 + idx, ips_len);
-            output.write_fmt(format_args!("{traceroute}\n"))?;
-        }
-        Ok(())
-    })
+    Ok(())
 }
 
 fn ips_from_csv(path: &str, num: usize) -> Result<Vec<Ipv4Addr>> {
@@ -68,24 +61,53 @@ fn ips_from_csv(path: &str, num: usize) -> Result<Vec<Ipv4Addr>> {
         .choose_multiple(&mut rng, num))
 }
 
-fn _get_ips(path: &str, num: usize) -> Result<Vec<Ipv4Addr>> {
-    let mut rng = thread_rng();
+struct Receiver;
+#[derive(Debug)]
+struct ReceiveMsg {
+    icmp_type: IcmpType,
+    source: Ipv4Addr,
+    id: u16,
+    seq_num: u16,
+    at: Instant,
+}
+impl Receiver {
+    fn spawn(mut rx_socket: transport::TransportReceiver, tx_channel: mpsc::Sender<ReceiveMsg>) {
+        thread::spawn(move || {
+            let mut packet_iter = ipv4_packet_iter(&mut rx_socket);
+            loop {
+                if let Some((packet, _)) = packet_iter
+                    .next_with_timeout(Duration::from_secs(30))
+                    .ok()
+                    .flatten()
+                {
+                    //skip non icmp
+                    if packet.get_next_level_protocol() != IpNextHeaderProtocols::Icmp {
+                        break;
+                    }
+                    let Some(packet) = ipv4::Ipv4Packet::new(packet.payload()) else {
+                        log::error!("Fail to decode to IPV4");
+                        break;
+                    };
 
-    Ok(read_to_string(path)?
-        .lines()
-        .skip(1)
-        .take(1_000_000)
-        .filter_map(|line| {
-            let parts: Vec<_> = line.split_whitespace().collect();
-            let block = u64::from_str_radix(parts[0], 16).ok()?;
-            let octet = u8::from_str_radix(parts[1].split(',').next()?, 16).ok()?;
+                    let Some(icmp_packet) = IcmpPacket::new(packet.payload()) else {
+                        log::error!("Fail to decode to ICMP");
+                        break;
+                    };
 
-            Some(Ipv4Addr::new(
-                ((block >> 24) & 0xff) as u8,
-                ((block >> 16) & 0xff) as u8,
-                ((block >> 8) & 0xff) as u8,
-                octet,
-            ))
-        })
-        .choose_multiple(&mut rng, num))
+                    let msg = ReceiveMsg {
+                        icmp_type: icmp_packet.get_icmp_type(),
+                        source: packet.get_source(),
+                        id: packet.get_identification(),
+                        seq_num: 0,
+                        at: Instant::now(),
+                    };
+                    log::debug!("{:?}", msg);
+
+                    if let Err(e) = tx_channel.send(msg) {
+                        log::error!("{:?}", e);
+                    }
+                }
+            }
+        });
+    }
 }

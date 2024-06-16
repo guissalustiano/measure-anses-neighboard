@@ -228,7 +228,7 @@ impl Tracer {
                 }
                 _ => todo!(),
             };
-        }   else {
+        } else {
             println!("SHOULD NOT BE REACHED");
         }
     }
