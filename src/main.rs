@@ -1,7 +1,7 @@
-use anyhow::{Context, Result};
+use anyhow::{anyhow, bail, Context, Error, Result};
 use pnet::{
     packet::{
-        icmp::{self, IcmpPacket, IcmpType},
+        icmp::{self, IcmpPacket, IcmpType, IcmpTypes},
         ip::{self, IpNextHeaderProtocols},
         ipv4::{self, Ipv4Packet},
         Packet,
@@ -10,13 +10,15 @@ use pnet::{
 };
 use rand::{seq::IteratorRandom, thread_rng};
 use std::{
+    collections::{BTreeMap, VecDeque},
     env,
     fs::read_to_string,
     net::Ipv4Addr,
+    ops::Add,
     str::FromStr,
-    sync::mpsc::{self},
+    sync::mpsc,
     thread,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 fn icmp_transport_channel(
@@ -28,17 +30,201 @@ fn icmp_transport_channel(
     )
 }
 
+const MAX_PARALLEL_TRACEROUTES: usize = 16;
+const HARD_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_HOPS: Ttl = Ttl(32);
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
-    let ips = ips_from_csv(&args[1], 100)?;
+    let ips: VecDeque<_> = ips_from_csv(&args[1], 100)?.into();
 
     let (transport_tx, transport_rx) = icmp_transport_channel(2048).unwrap();
     let (receiver_tx, receiver_rx) = mpsc::channel();
     let (transmiter_tx, transmiter_rx) = mpsc::channel();
     Receiver::spawn(transport_rx, receiver_tx);
     Transmiter::spawn(transport_tx, transmiter_rx);
+    Controller::<MAX_PARALLEL_TRACEROUTES>::new(ips, transmiter_tx, receiver_rx)
+        .spawn()
+        .unwrap();
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct DataRow {
+    destination: Ipv4Addr,
+    ttl: Ttl,
+    ip: Ipv4Addr,
+    duration: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Ttl(u8);
+impl Add<u8> for Ttl {
+    type Output = Self;
+
+    fn add(self, rhs: u8) -> Self::Output {
+        Self(self.0 + rhs)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Id(u16);
+
+#[derive(Debug, Clone, Copy)]
+struct Metadata {
+    destination: Ipv4Addr,
+    ttl: Ttl,
+    at: Instant,
+}
+struct Controller<const N: usize> {
+    queue: VecDeque<Ipv4Addr>,
+    ttl_store: BTreeMap<Ipv4Addr, Ttl>,
+    id_register: BTreeMap<u16, Metadata>,
+    id: u16,
+    tx: mpsc::Sender<TransmiterMsg>,
+    rx: mpsc::Receiver<ReceiveMsg>,
+}
+
+impl<const N: usize> Controller<N> {
+    fn new(
+        ips: VecDeque<Ipv4Addr>,
+        tx: mpsc::Sender<TransmiterMsg>,
+        rx: mpsc::Receiver<ReceiveMsg>,
+    ) -> Self {
+        Self {
+            queue: ips,
+            ttl_store: BTreeMap::new(),
+            id_register: BTreeMap::new(),
+            id: 404,
+            tx,
+            rx,
+        }
+    }
+
+    fn clean_register(&mut self) {
+        let now = Instant::now();
+        self.id_register.retain(|_, m| now - m.at < HARD_TIMEOUT);
+    }
+
+    fn get_unique_id(&mut self) -> Result<u16> {
+        for offset in 0..u16::MAX {
+            let id = self.id.saturating_add(offset);
+            if !self.id_register.contains_key(&id) {
+                self.id = id + 1;
+                return Ok(id);
+            }
+        }
+
+        // Try again after clean
+        self.clean_register();
+        for offset in 0..u16::MAX {
+            let id = self.id.saturating_add(offset);
+            if !self.id_register.contains_key(&id) {
+                self.id = id + 1;
+                return Ok(id);
+            }
+        }
+        bail!("All ids are in use");
+    }
+
+    fn request(&mut self, m: Metadata) -> Result<()> {
+        let id = self.get_unique_id()?;
+        self.id_register.insert(id, m);
+        self.tx
+            .send(TransmiterMsg {
+                destination: m.destination,
+                id: Id(id),
+                ttl: m.ttl,
+            })
+            .context("Fail to send the request")
+    }
+
+    fn end(&mut self, ip: Ipv4Addr) -> Result<Option<Ttl>> {
+        self.ttl_store.remove(&ip);
+        self.start_new_traceroute()
+    }
+
+    fn request_next_hop(&mut self, ip: Ipv4Addr) -> Result<Option<Ttl>> {
+        let ttl = if let Some(ttl) = self.ttl_store.get(&ip) {
+            *ttl + 1
+        } else {
+            Ttl(0)
+        };
+
+        if ttl > MAX_HOPS {
+            log::info!("Max hops {}", ip);
+            self.end(ip);
+            return Ok(None);
+        }
+
+        self.ttl_store.insert(ip, ttl);
+        self.request(Metadata {
+            destination: ip,
+            ttl,
+            at: Instant::now(),
+        })?;
+
+        Ok(Some(ttl))
+    }
+
+    fn start_new_traceroute(&mut self) -> Result<Option<Ttl>> {
+        let Some(ip) = self.queue.pop_front() else {
+            return Ok(None);
+        };
+
+        self.request_next_hop(ip)
+    }
+
+    fn handle_response(&mut self, rcv: ReceiveMsg) -> Result<DataRow> {
+        let Some(m) = self.id_register.get(&rcv.id.0).cloned() else {
+            bail!("Can't find the pkg id {:?}", rcv.id)
+        };
+        self.id_register.remove(&rcv.id.0);
+
+        let data = DataRow {
+            destination: m.destination,
+            ttl: m.ttl,
+            ip: rcv.source,
+            duration: rcv.at - m.at,
+        };
+
+        let is_end = match rcv.icmp_type {
+            IcmpTypes::TimeExceeded => false,
+            IcmpTypes::DestinationUnreachable | IcmpTypes::EchoReply => true,
+            _ => bail!("Invalid icmp_type"),
+        };
+
+        if is_end {
+            self.end(m.destination)?;
+        } else {
+            self.request_next_hop(m.destination)?;
+        }
+
+        Ok(data)
+    }
+
+    fn spawn(&mut self) -> Result<()> {
+        (0..MAX_PARALLEL_TRACEROUTES)
+            .into_iter()
+            .try_for_each(|_| {
+                self.start_new_traceroute()?;
+                Ok::<_, Error>(())
+            })?;
+
+        loop {
+            let response = self.rx.recv_timeout(Duration::from_secs(120))?;
+            self.handle_response(response)
+                .map(|data| {
+                    // TODO: save in csv
+                    println!("{:?}", data);
+                })
+                .map_err(|e| {
+                    log::error!("Error handle response {}", e);
+                })
+                .ok();
+            // TODO: check for soft timeouts
+        }
+    }
 }
 
 fn ips_from_csv(path: &str, num: usize) -> Result<Vec<Ipv4Addr>> {
@@ -69,7 +255,7 @@ struct Receiver;
 struct ReceiveMsg {
     icmp_type: IcmpType,
     source: Ipv4Addr,
-    id: u16,
+    id: Id,
     at: Instant,
 }
 impl Receiver {
@@ -97,8 +283,8 @@ struct Transmiter;
 #[derive(Debug)]
 struct TransmiterMsg {
     destination: Ipv4Addr,
-    id: u16,
-    ttl: u8,
+    id: Id,
+    ttl: Ttl,
 }
 impl Transmiter {
     fn spawn(mut tx_socket: transport::TransportSender, rx_channel: mpsc::Receiver<TransmiterMsg>) {
@@ -109,7 +295,13 @@ impl Transmiter {
                 .context("Fail to receive")
                 .and_then(|msg| {
                     seq_num += 1;
-                    send_echo(&mut tx_socket, seq_num, msg.destination, msg.ttl, msg.id)
+                    send_echo(
+                        &mut tx_socket,
+                        seq_num,
+                        msg.destination,
+                        msg.ttl.0,
+                        msg.id.0,
+                    )
                 })
                 .map_err(|e| {
                     log::error!("{:?}", e);
@@ -130,7 +322,7 @@ fn receive_packets(tx_channel: &mut mpsc::Sender<ReceiveMsg>, packet: Ipv4Packet
     let msg = ReceiveMsg {
         icmp_type: icmp_packet.get_icmp_type(),
         source: packet.get_source(),
-        id: packet.get_identification(),
+        id: Id(packet.get_identification()),
         at: Instant::now(),
     };
     log::debug!("{:?}", msg);
