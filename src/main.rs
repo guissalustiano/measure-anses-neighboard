@@ -149,7 +149,7 @@ impl<const N: usize> Controller<N> {
         let ttl = if let Some(ttl) = self.ttl_store.get(&ip) {
             *ttl + 1
         } else {
-            Ttl(0)
+            Ttl(1)
         };
 
         if ttl > MAX_HOPS {
