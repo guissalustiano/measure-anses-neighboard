@@ -32,6 +32,7 @@ fn icmp_transport_channel(
 
 const MAX_PARALLEL_TRACEROUTES: usize = 16;
 const HARD_TIMEOUT: Duration = Duration::from_secs(60);
+const SOFT_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_HOPS: Ttl = Ttl(32);
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
@@ -153,7 +154,7 @@ impl<const N: usize> Controller<N> {
 
         if ttl > MAX_HOPS {
             log::info!("Max hops {}", ip);
-            self.end(ip);
+            self.end(ip)?;
             return Ok(None);
         }
 
@@ -222,7 +223,29 @@ impl<const N: usize> Controller<N> {
                     log::error!("Error handle response {}", e);
                 })
                 .ok();
-            // TODO: check for soft timeouts
+
+            // check for soft timeouts
+            let softimeout_lookup: BTreeMap<(Ipv4Addr, Ttl), Instant> = self
+                .id_register
+                .values()
+                .into_iter()
+                .map(|r| ((r.destination, r.ttl), r.at))
+                .collect();
+
+            let now = Instant::now();
+            self.ttl_store
+                .clone()
+                .iter()
+                .filter(|(ip, ttl)| {
+                    softimeout_lookup
+                        .get(&(**ip, **ttl))
+                        .is_some_and(|t| now - *t > SOFT_TIMEOUT)
+                })
+                .try_for_each(|(ip, _)| self.request_next_hop(*ip).map(|_| ()))
+                .map_err(|e| {
+                    log::error!("Error handle response {}", e);
+                })
+                .ok();
         }
     }
 }
