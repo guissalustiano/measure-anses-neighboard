@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Error, Result};
 use pnet::{
     packet::{
+        self,
         icmp::{self, IcmpPacket, IcmpType, IcmpTypes},
         ip::{self, IpNextHeaderProtocols},
         ipv4::{self, Ipv4Packet},
@@ -16,7 +17,7 @@ use std::{
     net::Ipv4Addr,
     ops::Add,
     str::FromStr,
-    sync::mpsc,
+    sync::mpsc::{self, RecvTimeoutError},
     thread,
     time::{Duration, Instant},
 };
@@ -30,15 +31,16 @@ fn icmp_transport_channel(
     )
 }
 
-const MAX_PARALLEL_TRACEROUTES: usize = 16;
-const HARD_TIMEOUT: Duration = Duration::from_secs(60);
-const SOFT_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_PARALLEL_TRACEROUTES: usize = 64;
+const HARD_TIMEOUT: Duration = Duration::from_secs(120);
+const SOFT_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HOPS: Ttl = Ttl(32);
 fn main() -> Result<()> {
+    env_logger::init();
     let args: Vec<String> = env::args().collect();
     let ips: VecDeque<_> = ips_from_csv(&args[1], 100)?.into();
 
-    let (transport_tx, transport_rx) = icmp_transport_channel(2048).unwrap();
+    let (transport_tx, transport_rx) = icmp_transport_channel(1 << 12).unwrap();
     let (receiver_tx, receiver_rx) = mpsc::channel();
     let (transmiter_tx, transmiter_rx) = mpsc::channel();
     Receiver::spawn(transport_rx, receiver_tx);
@@ -131,6 +133,13 @@ impl<const N: usize> Controller<N> {
     fn request(&mut self, m: Metadata) -> Result<()> {
         let id = self.get_unique_id()?;
         self.id_register.insert(id, m);
+        log::debug!(
+            "Sending pkg {:?}, currently id's waiting for answer: {}",
+            id,
+            self.id_register.len()
+        );
+        log::debug!("Sending pkg {:?}", id);
+
         self.tx
             .send(TransmiterMsg {
                 destination: m.destination,
@@ -153,7 +162,7 @@ impl<const N: usize> Controller<N> {
         };
 
         if ttl > MAX_HOPS {
-            log::info!("Max hops {}", ip);
+            log::warn!("Max hops {}", ip);
             self.end(ip)?;
             return Ok(None);
         }
@@ -177,10 +186,12 @@ impl<const N: usize> Controller<N> {
     }
 
     fn handle_response(&mut self, rcv: ReceiveMsg) -> Result<DataRow> {
-        let Some(m) = self.id_register.get(&rcv.id.0).cloned() else {
+        let id = rcv.id.0;
+        let Some(m) = self.id_register.get(&id).cloned() else {
             bail!("Can't find the pkg id {:?}", rcv.id)
         };
-        self.id_register.remove(&rcv.id.0);
+        self.id_register.remove(&id);
+        log::debug!("Received pkg {id}");
 
         let data = DataRow {
             destination: m.destination,
@@ -213,39 +224,46 @@ impl<const N: usize> Controller<N> {
             })?;
 
         loop {
-            let response = self.rx.recv_timeout(Duration::from_secs(120))?;
-            self.handle_response(response)
-                .map(|data| {
-                    // TODO: save in csv
-                    println!("{:?}", data);
-                })
-                .map_err(|e| {
-                    log::error!("Error handle response {}", e);
-                })
-                .ok();
+            match self.rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(response) => {
+                    self.handle_response(response)
+                        .map(|data| {
+                            // TODO: save in csv
+                            println!("{:?}", data);
+                        })
+                        .map_err(|e| {
+                            log::error!("Error handle response {}", e);
+                        })
+                        .ok();
+                }
+                Err(RecvTimeoutError::Timeout) => {
+                    // check for soft timeout expired
+                    let softimeout_lookup: BTreeMap<(Ipv4Addr, Ttl), Instant> = self
+                        .id_register
+                        .values()
+                        .into_iter()
+                        .map(|r| ((r.destination, r.ttl), r.at))
+                        .collect();
 
-            // check for soft timeouts
-            let softimeout_lookup: BTreeMap<(Ipv4Addr, Ttl), Instant> = self
-                .id_register
-                .values()
-                .into_iter()
-                .map(|r| ((r.destination, r.ttl), r.at))
-                .collect();
-
-            let now = Instant::now();
-            self.ttl_store
-                .clone()
-                .iter()
-                .filter(|(ip, ttl)| {
-                    softimeout_lookup
-                        .get(&(**ip, **ttl))
-                        .is_some_and(|t| now - *t > SOFT_TIMEOUT)
-                })
-                .try_for_each(|(ip, _)| self.request_next_hop(*ip).map(|_| ()))
-                .map_err(|e| {
-                    log::error!("Error handle response {}", e);
-                })
-                .ok();
+                    let now = Instant::now();
+                    self.ttl_store
+                        .clone()
+                        .iter()
+                        .filter(|(ip, ttl)| {
+                            softimeout_lookup
+                                .get(&(**ip, **ttl))
+                                .is_some_and(|t| now - *t > SOFT_TIMEOUT)
+                        })
+                        .try_for_each(|(ip, _)| self.request_next_hop(*ip).map(|_| ()))
+                        .map_err(|e| {
+                            log::error!("Error handle response {}", e);
+                        })
+                        .ok();
+                }
+                Err(RecvTimeoutError::Disconnected) => {
+                    bail!("Channel disconected")
+                }
+            }
         }
     }
 }
@@ -291,10 +309,10 @@ impl Receiver {
             loop {
                 packet_iter
                     .next()
-                    .context("Fail to receive a package")
+                    .context("Fail to receive the pkg")
                     .and_then(|(packet, _)| receive_packets(&mut tx_channel, packet))
                     .map_err(|e| {
-                        log::error!("{:?}", e);
+                        log::warn!("{:?}", e);
                     })
                     .ok();
             }
@@ -315,7 +333,7 @@ impl Transmiter {
         thread::spawn(move || loop {
             rx_channel
                 .recv()
-                .context("Fail to receive")
+                .context("Fail to receive TransmitterMsg")
                 .and_then(|msg| {
                     seq_num += 1;
                     send_echo(
@@ -327,7 +345,7 @@ impl Transmiter {
                     )
                 })
                 .map_err(|e| {
-                    log::error!("{:?}", e);
+                    log::warn!("{:?}", e);
                 })
                 .ok();
         });
@@ -340,19 +358,42 @@ fn receive_packets(tx_channel: &mut mpsc::Sender<ReceiveMsg>, packet: Ipv4Packet
         return Ok(());
     }
 
-    let icmp_packet = IcmpPacket::new(packet.payload()).context("Fail to decode to ICMP")?;
+    let source = packet.get_source();
+    let packet = IcmpPacket::new(packet.payload()).context("Fail to decode to ICMP")?;
+
+    let id = match packet.get_icmp_type() {
+        icmp::IcmpTypes::EchoReply => {
+            let packet = icmp::echo_reply::EchoReplyPacket::new(packet.packet())
+                .context("Fail to parce Icmp Echo Reply")?;
+            packet.get_identifier()
+        }
+        icmp::IcmpTypes::TimeExceeded => {
+            let packet = icmp::time_exceeded::TimeExceededPacket::new(packet.packet())
+                .context("Fail to parce Icmp Time Exceeded")?;
+
+            let packet = ipv4::Ipv4Packet::new(packet.payload())
+                .context("Fail to parce Icmp Time Exceeded")?;
+            packet.get_identification()
+        }
+        icmp::IcmpTypes::DestinationUnreachable => {
+            bail!("Destination unreachagle {}", source);
+        }
+        _ => {
+            log::warn!("Invalid ICMP Type");
+            return Ok(());
+        }
+    };
 
     let msg = ReceiveMsg {
-        icmp_type: icmp_packet.get_icmp_type(),
-        source: packet.get_source(),
-        id: Id(packet.get_identification()),
+        icmp_type: packet.get_icmp_type(),
+        source,
+        id: Id(id),
         at: Instant::now(),
     };
-    log::debug!("{:?}", msg);
 
     tx_channel
         .send(msg)
-        .context("Fail to transmit received package")
+        .context("Fail to send received package")
 }
 
 pub fn send_echo(
