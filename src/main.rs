@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Context, Error, Result};
+use anyhow::{bail, Context, Error, Result};
 use pnet::{
     packet::{
         self,
@@ -117,16 +117,6 @@ impl<const N: usize> Controller<N> {
                 return Ok(id);
             }
         }
-
-        // Try again after clean
-        self.clean_register();
-        for offset in 0..u16::MAX {
-            let id = self.id.saturating_add(offset);
-            if !self.id_register.contains_key(&id) {
-                self.id = id + 1;
-                return Ok(id);
-            }
-        }
         bail!("All ids are in use");
     }
 
@@ -138,7 +128,6 @@ impl<const N: usize> Controller<N> {
             id,
             self.id_register.len()
         );
-        log::debug!("Sending pkg {:?}", id);
 
         self.tx
             .send(TransmiterMsg {
@@ -259,6 +248,12 @@ impl<const N: usize> Controller<N> {
                             log::error!("Error handle response {}", e);
                         })
                         .ok();
+
+                    self.clean_register();
+
+                    if self.id_register.is_empty() {
+                        return Ok(());
+                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     bail!("Channel disconected")
