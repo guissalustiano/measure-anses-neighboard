@@ -1,7 +1,6 @@
-use anyhow::{bail, Context, Error, Result};
+use anyhow::{bail, Context, Result};
 use pnet::{
     packet::{
-        self,
         icmp::{self, IcmpPacket, IcmpType, IcmpTypes},
         ip::{self, IpNextHeaderProtocols},
         ipv4::{self, Ipv4Packet},
@@ -13,7 +12,8 @@ use rand::{seq::IteratorRandom, thread_rng};
 use std::{
     collections::{BTreeMap, VecDeque},
     env,
-    fs::read_to_string,
+    fs::{read_to_string, File},
+    io::Write,
     net::Ipv4Addr,
     ops::Add,
     str::FromStr,
@@ -31,33 +31,27 @@ fn icmp_transport_channel(
     )
 }
 
-const MAX_PARALLEL_TRACEROUTES: usize = 64;
-const HARD_TIMEOUT: Duration = Duration::from_secs(120);
-const SOFT_TIMEOUT: Duration = Duration::from_secs(3);
-const MAX_HOPS: Ttl = Ttl(32);
+const MAX_PARALLEL_TRACEROUTES: usize = 128;
+const HARD_TIMEOUT: Duration = Duration::from_secs(60);
+const SOFT_TIMEOUT: Duration = Duration::from_secs(1);
+const MAX_HOPS: Ttl = Ttl(20);
 fn main() -> Result<()> {
     env_logger::init();
     let args: Vec<String> = env::args().collect();
-    let ips: VecDeque<_> = ips_from_csv(&args[1], 100)?.into();
+    let ips: VecDeque<_> = ips_from_csv(&args[1], 10_000)?.into();
 
     let (transport_tx, transport_rx) = icmp_transport_channel(1 << 12).unwrap();
     let (receiver_tx, receiver_rx) = mpsc::channel();
     let (transmiter_tx, transmiter_rx) = mpsc::channel();
+    let (writter_tx, writter_rx) = mpsc::channel();
     Receiver::spawn(transport_rx, receiver_tx);
     Transmiter::spawn(transport_tx, transmiter_rx);
-    Controller::<MAX_PARALLEL_TRACEROUTES>::new(ips, transmiter_tx, receiver_rx)
+    Writter::spawn(writter_rx);
+    Controller::new(ips, transmiter_tx, receiver_rx, writter_tx)
         .spawn()
         .unwrap();
 
     Ok(())
-}
-
-#[derive(Debug)]
-struct DataRow {
-    destination: Ipv4Addr,
-    ttl: Ttl,
-    ip: Ipv4Addr,
-    duration: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -79,20 +73,22 @@ struct Metadata {
     ttl: Ttl,
     at: Instant,
 }
-struct Controller<const N: usize> {
+struct Controller {
     queue: VecDeque<Ipv4Addr>,
     ttl_store: BTreeMap<Ipv4Addr, Ttl>,
     id_register: BTreeMap<u16, Metadata>,
     id: u16,
     tx: mpsc::Sender<TransmiterMsg>,
     rx: mpsc::Receiver<ReceiveMsg>,
+    writter: mpsc::Sender<DataRow>,
 }
 
-impl<const N: usize> Controller<N> {
+impl Controller {
     fn new(
         ips: VecDeque<Ipv4Addr>,
         tx: mpsc::Sender<TransmiterMsg>,
         rx: mpsc::Receiver<ReceiveMsg>,
+        writter: mpsc::Sender<DataRow>,
     ) -> Self {
         Self {
             queue: ips,
@@ -101,6 +97,7 @@ impl<const N: usize> Controller<N> {
             id: 404,
             tx,
             rx,
+            writter,
         }
     }
 
@@ -113,7 +110,7 @@ impl<const N: usize> Controller<N> {
         for offset in 0..u16::MAX {
             let id = self.id.saturating_add(offset);
             if !self.id_register.contains_key(&id) {
-                self.id = id + 1;
+                self.id = id.saturating_add(1);
                 return Ok(id);
             }
         }
@@ -124,9 +121,10 @@ impl<const N: usize> Controller<N> {
         let id = self.get_unique_id()?;
         self.id_register.insert(id, m);
         log::debug!(
-            "Sending pkg {:?}, currently id's waiting for answer: {}",
+            "Sending pkg {:?} to {} with ttl {}",
             id,
-            self.id_register.len()
+            m.destination,
+            m.ttl.0
         );
 
         self.tx
@@ -140,7 +138,7 @@ impl<const N: usize> Controller<N> {
 
     fn end(&mut self, ip: Ipv4Addr) -> Result<Option<Ttl>> {
         self.ttl_store.remove(&ip);
-        self.start_new_traceroute()
+        Ok(None)
     }
 
     fn request_next_hop(&mut self, ip: Ipv4Addr) -> Result<Option<Ttl>> {
@@ -156,12 +154,12 @@ impl<const N: usize> Controller<N> {
             return Ok(None);
         }
 
-        self.ttl_store.insert(ip, ttl);
         self.request(Metadata {
             destination: ip,
             ttl,
             at: Instant::now(),
         })?;
+        self.ttl_store.insert(ip, ttl);
 
         Ok(Some(ttl))
     }
@@ -171,7 +169,35 @@ impl<const N: usize> Controller<N> {
             return Ok(None);
         };
 
-        self.request_next_hop(ip)
+        let res = self.request_next_hop(ip);
+        self.queue.pop_front();
+        res
+    }
+
+    fn fill_parallel_request(&mut self) -> Result<()> {
+        let n = MAX_PARALLEL_TRACEROUTES - self.ttl_store.len();
+        (0..n).try_for_each(|_| self.start_new_traceroute().map(|_| ()))
+    }
+
+    fn increase_ttl(&mut self) -> Result<()> {
+        log::debug!("Check for softtimeout expired");
+        let softimeout_lookup: BTreeMap<(Ipv4Addr, Ttl), Instant> = self
+            .id_register
+            .values()
+            .into_iter()
+            .map(|r| ((r.destination, r.ttl), r.at))
+            .collect();
+
+        let now = Instant::now();
+        self.ttl_store
+            .clone()
+            .iter()
+            .filter(|(ip, ttl)| {
+                softimeout_lookup
+                    .get(&(**ip, **ttl))
+                    .is_some_and(|t| now - *t > SOFT_TIMEOUT)
+            })
+            .try_for_each(|(ip, _)| self.request_next_hop(*ip).map(|_| ()))
     }
 
     fn handle_response(&mut self, rcv: ReceiveMsg) -> Result<DataRow> {
@@ -205,59 +231,41 @@ impl<const N: usize> Controller<N> {
     }
 
     fn spawn(&mut self) -> Result<()> {
-        (0..MAX_PARALLEL_TRACEROUTES)
-            .into_iter()
-            .try_for_each(|_| {
-                self.start_new_traceroute()?;
-                Ok::<_, Error>(())
-            })?;
-
         loop {
             match self.rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(response) => {
                     self.handle_response(response)
-                        .map(|data| {
-                            // TODO: save in csv
-                            println!("{:?}", data);
-                        })
+                        .map(|data| self.writter.send(data))
                         .map_err(|e| {
                             log::error!("Error handle response {}", e);
                         })
                         .ok();
                 }
                 Err(RecvTimeoutError::Timeout) => {
-                    // check for soft timeout expired
-                    let softimeout_lookup: BTreeMap<(Ipv4Addr, Ttl), Instant> = self
-                        .id_register
-                        .values()
-                        .into_iter()
-                        .map(|r| ((r.destination, r.ttl), r.at))
-                        .collect();
-
-                    let now = Instant::now();
-                    self.ttl_store
-                        .clone()
-                        .iter()
-                        .filter(|(ip, ttl)| {
-                            softimeout_lookup
-                                .get(&(**ip, **ttl))
-                                .is_some_and(|t| now - *t > SOFT_TIMEOUT)
-                        })
-                        .try_for_each(|(ip, _)| self.request_next_hop(*ip).map(|_| ()))
+                    self.fill_parallel_request()
                         .map_err(|e| {
-                            log::error!("Error handle response {}", e);
+                            log::error!("Error filling requests {}", e);
                         })
                         .ok();
-
+                    self.increase_ttl()
+                        .map_err(|e| {
+                            log::error!("Error increasing ttls {}", e);
+                        })
+                        .ok();
                     self.clean_register();
-
-                    if self.id_register.is_empty() {
-                        return Ok(());
-                    }
                 }
                 Err(RecvTimeoutError::Disconnected) => {
                     bail!("Channel disconected")
                 }
+            }
+            log::info!(
+                        "There is {} ips in the queue, we are running {} and waiting for waiting for answers: {}",
+                        self.queue.len(),
+                        self.ttl_store.len(),
+                        self.id_register.len(),
+                    );
+            if self.id_register.is_empty() {
+                return Ok(());
             }
         }
     }
@@ -284,6 +292,52 @@ fn ips_from_csv(path: &str, num: usize) -> Result<Vec<Ipv4Addr>> {
         .take(1_000_000)
         .map(|i| i.1)
         .choose_multiple(&mut rng, num))
+}
+
+#[derive(Debug)]
+struct DataRow {
+    destination: Ipv4Addr,
+    ttl: Ttl,
+    ip: Ipv4Addr,
+    duration: Duration,
+}
+struct Writter;
+impl Writter {
+    fn spawn(rx_channel: mpsc::Receiver<DataRow>) {
+        thread::spawn(move || {
+            let mut file = File::create("data.csv").expect("Can't create a file");
+            file.write_all(
+                format!("{},{},{},{}\n", "destination", "ttl", "ip", "duration").as_bytes(),
+            )
+            .map_err(|e| {
+                log::error!("Fail to write to a file: {e:?}");
+            })
+            .ok();
+
+            loop {
+                let Ok(row) = rx_channel.recv() else {
+                    log::error!("Fail to receive data");
+                    continue;
+                };
+
+                log::debug!("Writing: {row:?}");
+                file.write_all(
+                    format!(
+                        "{},{},{},{}\n",
+                        row.destination,
+                        row.ttl.0,
+                        row.ip,
+                        row.duration.as_millis(),
+                    )
+                    .as_bytes(),
+                )
+                .map_err(|e| {
+                    log::error!("Fail to write to a file: {e:?}");
+                })
+                .ok();
+            }
+        });
+    }
 }
 
 struct Receiver;
@@ -371,7 +425,14 @@ fn receive_packets(tx_channel: &mut mpsc::Sender<ReceiveMsg>, packet: Ipv4Packet
             packet.get_identification()
         }
         icmp::IcmpTypes::DestinationUnreachable => {
-            bail!("Destination unreachagle {}", source);
+            let packet =
+                icmp::destination_unreachable::DestinationUnreachablePacket::new(packet.packet())
+                    .context("Fail to parce Icmp Time Exceeded")?;
+
+            let packet = ipv4::Ipv4Packet::new(packet.payload())
+                .context("Fail to parce Icmp Time Exceeded")?;
+
+            packet.get_identification()
         }
         _ => {
             log::warn!("Invalid ICMP Type");
