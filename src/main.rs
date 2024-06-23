@@ -31,12 +31,26 @@ fn icmp_transport_channel(
     )
 }
 
-const MAX_PARALLEL_TRACEROUTES: usize = 128;
+const MAX_PARALLEL_TRACEROUTES: usize = 32;
 const HARD_TIMEOUT: Duration = Duration::from_secs(60);
 const SOFT_TIMEOUT: Duration = Duration::from_secs(1);
-const MAX_HOPS: Ttl = Ttl(20);
+const MAX_HOPS: Ttl = Ttl(24);
 fn main() -> Result<()> {
-    env_logger::init();
+    fern::Dispatch::new()
+        // Perform allocation-free log formatting
+        .format(|out, message, record| {
+            out.finish(format_args!(
+                "[{} {} {}] {}",
+                humantime::format_rfc3339(std::time::SystemTime::now()),
+                record.level(),
+                record.target(),
+                message
+            ))
+        })
+        .level(log::LevelFilter::Debug)
+        .chain(fern::log_file("output.log")?)
+        .apply()?;
+
     let args: Vec<String> = env::args().collect();
     let ips: VecDeque<_> = ips_from_csv(&args[1], 10_000)?.into();
 
@@ -108,9 +122,9 @@ impl Controller {
 
     fn get_unique_id(&mut self) -> Result<u16> {
         for offset in 0..u16::MAX {
-            let id = self.id.saturating_add(offset);
+            let (id, _) = self.id.overflowing_add(offset);
             if !self.id_register.contains_key(&id) {
-                self.id = id.saturating_add(1);
+                self.id = id;
                 return Ok(id);
             }
         }
