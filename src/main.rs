@@ -54,7 +54,7 @@ fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
     let ips: VecDeque<_> = ips_from_csv(&args[1], 10_000)?.into();
 
-    let (transport_tx, transport_rx) = icmp_transport_channel(1 << 12).unwrap();
+    let (transport_tx, transport_rx) = icmp_transport_channel(1 << 14).unwrap();
     let (receiver_tx, receiver_rx) = mpsc::channel();
     let (transmiter_tx, transmiter_rx) = mpsc::channel();
     let (writter_tx, writter_rx) = mpsc::channel();
@@ -179,13 +179,13 @@ impl Controller {
     }
 
     fn start_new_traceroute(&mut self) -> Result<Option<Ttl>> {
-        let Some(ip) = self.queue.pop_front() else {
+        let Some(ip) = self.queue.front() else {
             return Ok(None);
         };
 
-        let res = self.request_next_hop(ip);
+        let res = self.request_next_hop(*ip)?;
         self.queue.pop_front();
-        res
+        Ok(res)
     }
 
     fn fill_parallel_request(&mut self) -> Result<()> {
