@@ -4,5 +4,5 @@
 .direnv
 flake.nix
 flake.lock
-ips.csv
+*.csv
 output.txt

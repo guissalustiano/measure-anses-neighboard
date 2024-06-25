@@ -8,4 +8,4 @@ df = pl.read_csv(
     comment_prefix="#",
 )
 
-df.filter(pl.col("score").gt(20)).select(pl.col("ip"), pl.col("score")).write_csv("ips.csv")
+df.filter(pl.col("score").gt(20)).select(pl.col("ip")).write_csv("ips.csv", include_header=False)
