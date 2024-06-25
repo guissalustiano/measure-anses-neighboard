@@ -23,8 +23,6 @@ use std::{
 use rand_pcg::Pcg64;
 use rand_seeder::Seeder;
 
-use indicatif::ProgressBar;
-
 const MAX_PARALLEL_TRACEROUTES: usize = 128;
 const HARD_TIMEOUT: Duration = Duration::from_secs(30);
 const SOFT_TIMEOUT: Duration = Duration::from_secs(1);
@@ -76,9 +74,9 @@ fn setup_log() -> Result<()> {
                 message
             ))
         })
-        .level(log::LevelFilter::Debug)
-        .chain(fern::log_file("output.log")?)
-        // .chain(std::io::stdout())
+        .level(log::LevelFilter::Info)
+        // .chain(fern::log_file("output.log")?)
+        .chain(std::io::stdout())
         .apply()?;
     Ok(())
 }
@@ -161,9 +159,7 @@ fn main() -> Result<()> {
     log::info!("Starting queues");
     let mut send_queue = generate_send_queue(ips);
     let mut wait_queue: WaitQueue = VecDeque::with_capacity(MAX_PARALLEL_TRACEROUTES);
-
-    let total_len = send_queue.len();
-    let pb = ProgressBar::new(total_len as u64);
+    log::info!("Total len: {}", send_queue.len());
 
     remove_already_runned(&mut send_queue, FILENAME);
 
@@ -200,7 +196,6 @@ fn main() -> Result<()> {
                 clean_wait_queue(&mut wait_queue);
 
                 let len = send_queue.len() + wait_queue.len();
-                pb.set_position((total_len - len) as u64);
                 if len == 0 {
                     break;
                 }
