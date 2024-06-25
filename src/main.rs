@@ -12,7 +12,7 @@ use rand::Rng;
 use serde_with::{serde_as, TimestampMilliSeconds};
 use std::{
     collections::{BTreeSet, VecDeque},
-    fs,
+    env, fs,
     net::Ipv4Addr,
     str::FromStr,
     sync::mpsc,
@@ -27,7 +27,6 @@ const MAX_PARALLEL_TRACEROUTES: usize = 128;
 const HARD_TIMEOUT: Duration = Duration::from_secs(30);
 const SOFT_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_HOPS: u8 = 24;
-const FILENAME: &str = "data.csv";
 const SEED: u16 = 404;
 
 // SendCommand -> WaitCommand -> DataRecord
@@ -108,7 +107,7 @@ fn generate_send_queue(ips: Vec<Ipv4Addr>) -> SendQueue {
         .collect()
 }
 
-fn spawn_writter(filename: &'static str) -> mpsc::Sender<DataRow> {
+fn spawn_writter(filename: String) -> mpsc::Sender<DataRow> {
     let (tx, rx) = mpsc::channel::<DataRow>();
     thread::spawn(move || {
         let file = fs::OpenOptions::new()
@@ -151,19 +150,22 @@ fn spawn_writter(filename: &'static str) -> mpsc::Sender<DataRow> {
 }
 
 fn main() -> Result<()> {
+    let filename = env::var("DATA_PATH").unwrap_or(String::from("data.csv"));
+    log::info!("Writing to file {filename}");
     setup_log()?;
 
     log::info!("Shuffluing ips");
     let ips = load_ips()?;
 
     log::info!("Starting queues");
+    // 122_037_168
     let mut send_queue = generate_send_queue(ips);
     let mut wait_queue: WaitQueue = VecDeque::with_capacity(MAX_PARALLEL_TRACEROUTES);
     log::info!("Total len: {}", send_queue.len());
 
-    remove_already_runned(&mut send_queue, FILENAME);
+    remove_already_runned(&mut send_queue, &filename);
 
-    let writter = spawn_writter(FILENAME);
+    let writter = spawn_writter(filename);
     let (mut icmp_tx, mut icmp_rx) = icmp_transport_channel(1 << 12).unwrap();
 
     let mut packet_iter = ipv4_packet_iter(&mut icmp_rx);
