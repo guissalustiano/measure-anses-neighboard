@@ -9,35 +9,36 @@ use pnet::{
     transport::{self, ipv4_packet_iter, transport_channel, TransportChannelType, TransportSender},
 };
 use rand::Rng;
+use serde_with::{serde_as, TimestampMilliSeconds};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeSet, VecDeque},
     fs,
-    io::Write,
     net::Ipv4Addr,
     str::FromStr,
     sync::mpsc,
-    thread::{self},
+    thread,
     time::{Duration, SystemTime},
 };
 
 use indicatif::ProgressBar;
 
-const MAX_PARALLEL_TRACEROUTES: usize = 124;
+const MAX_PARALLEL_TRACEROUTES: usize = 128;
 const HARD_TIMEOUT: Duration = Duration::from_secs(30);
 const SOFT_TIMEOUT: Duration = Duration::from_secs(1);
+const MIN_TIME_BETWEEN_PACKAGES: Duration = Duration::from_secs(30);
 const MAX_HOPS: u8 = 24;
 const FILENAME: &str = "data.csv";
 
 // SendCommand -> WaitCommand -> DataRecord
 // send_queue -> wait_queue -> write
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SendCommand {
     destination: Ipv4Addr,
     ttl: u8,
 }
 type SendQueue = VecDeque<SendCommand>;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 struct WaitCommand {
     destination: Ipv4Addr,
     ttl: u8,
@@ -46,13 +47,16 @@ struct WaitCommand {
 }
 type WaitQueue = VecDeque<WaitCommand>;
 
-#[derive(Debug, Clone, Copy)]
+#[serde_as]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct DataRow {
     destination: Ipv4Addr,
     ttl: u8,
     id: u16,
     ip: Ipv4Addr,
+    #[serde_as(as = "TimestampMilliSeconds<i64>")]
     send_at: SystemTime,
+    #[serde_as(as = "TimestampMilliSeconds<i64>")]
     received_at: SystemTime,
     terminator: bool,
 }
@@ -76,7 +80,7 @@ fn setup_log() -> Result<()> {
     Ok(())
 }
 
-fn load_ips(n: usize) -> Result<Vec<Ipv4Addr>> {
+fn load_ips() -> Result<Vec<Ipv4Addr>> {
     use rand::seq::SliceRandom;
     use rand::thread_rng;
 
@@ -84,7 +88,6 @@ fn load_ips(n: usize) -> Result<Vec<Ipv4Addr>> {
     let mut ips = include_str!("ips.csv")
         .lines()
         .map(Ipv4Addr::from_str)
-        .take(n)
         .collect::<Result<Vec<_>, _>>()?;
 
     ips.shuffle(&mut rng);
@@ -92,11 +95,17 @@ fn load_ips(n: usize) -> Result<Vec<Ipv4Addr>> {
     Ok(ips)
 }
 
+// generate batchs of commands
 fn generate_send_queue(ips: Vec<Ipv4Addr>) -> SendQueue {
-    (1..=MAX_HOPS)
-        .flat_map(|ttl| {
-            ips.iter()
-                .map(move |&destination| SendCommand { destination, ttl })
+    let ratio = MIN_TIME_BETWEEN_PACKAGES.as_millis() / SOFT_TIMEOUT.as_millis();
+    log::info!("{ratio}");
+    ips.chunks(MAX_PARALLEL_TRACEROUTES * ratio as usize)
+        .flat_map(|ip_windows| {
+            (1..=MAX_HOPS).flat_map(|ttl| {
+                ip_windows
+                    .iter()
+                    .map(move |&destination| SendCommand { destination, ttl })
+            })
         })
         .collect()
 }
@@ -104,17 +113,26 @@ fn generate_send_queue(ips: Vec<Ipv4Addr>) -> SendQueue {
 fn spawn_writter(filename: &'static str) -> mpsc::Sender<DataRow> {
     let (tx, rx) = mpsc::channel::<DataRow>();
     thread::spawn(move || {
-        let mut file = fs::OpenOptions::new()
+        let file = fs::OpenOptions::new()
             .append(true)
             .create(true)
             .open(filename)
             .expect("Can't create a file");
 
-        if let Err(e) = file.write_all(
-            format!("destination,ttl,ip,send_at,received_at,id,unreachable\n").as_bytes(),
-        ) {
+        let mut wtr = csv::Writer::from_writer(file);
+        /*
+        if let Err(e) = wtr.write_record(&[
+            "destination",
+            "ttl",
+            "ip",
+            "send_at",
+            "received_at",
+            "id",
+            "unreachable",
+        ]) {
             log::error!("Fail to write to a file: {e:?}");
         }
+        */
 
         loop {
             let Ok(row) = rx.recv() else {
@@ -123,26 +141,11 @@ fn spawn_writter(filename: &'static str) -> mpsc::Sender<DataRow> {
             };
 
             log::debug!("Writing: {row:?}");
-            if let Err(e) = file.write_all(
-                format!(
-                    "{},{},{},{},{},{},{}\n",
-                    row.destination,
-                    row.ttl,
-                    row.ip,
-                    row.send_at
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis(),
-                    row.received_at
-                        .duration_since(SystemTime::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis(),
-                    row.id,
-                    row.terminator,
-                )
-                .as_bytes(),
-            ) {
+            if let Err(e) = wtr.serialize(row) {
                 log::error!("Fail to write to a file: {e:?}");
+            };
+            if let Err(e) = wtr.flush() {
+                log::error!("Fail to flush to a file: {e:?}");
             };
         }
     });
@@ -151,11 +154,10 @@ fn spawn_writter(filename: &'static str) -> mpsc::Sender<DataRow> {
 
 fn main() -> Result<()> {
     setup_log()?;
-    let writter = spawn_writter(FILENAME);
-    let (mut icmp_tx, mut icmp_rx) = icmp_transport_channel(1 << 12).unwrap();
 
     log::info!("Shuffluing ips");
-    let ips = load_ips(1_000_000)?;
+    let ips = load_ips()?;
+
     log::info!("Starting queues");
     let mut send_queue = generate_send_queue(ips);
     let mut wait_queue: WaitQueue = VecDeque::with_capacity(MAX_PARALLEL_TRACEROUTES);
@@ -163,10 +165,15 @@ fn main() -> Result<()> {
     let total_len = send_queue.len();
     let pb = ProgressBar::new(total_len as u64);
 
+    remove_already_runned(&mut send_queue, FILENAME);
+
+    let writter = spawn_writter(FILENAME);
+    let (mut icmp_tx, mut icmp_rx) = icmp_transport_channel(1 << 12).unwrap();
+
     let mut packet_iter = ipv4_packet_iter(&mut icmp_rx);
     loop {
         log::info!("send: {}, wait: {}", send_queue.len(), wait_queue.len());
-        match packet_iter.next_with_timeout(Duration::from_millis(2000))? {
+        match packet_iter.next_with_timeout(Duration::from_millis(200))? {
             Some((pkg, _)) => match handle_packets(pkg, &mut wait_queue) {
                 Ok(data) => {
                     if let Err(e) = writter.send(data) {
@@ -175,6 +182,11 @@ fn main() -> Result<()> {
                     if data.terminator {
                         send_queue
                             .retain(|q| q.destination != data.destination || q.ttl < data.ttl);
+                        if let Err(e) =
+                            fill_wait_queue(&mut icmp_tx, &mut send_queue, &mut wait_queue)
+                        {
+                            log::warn!("Fail to send new pakages: {e}")
+                        }
                     }
                 }
                 Err(e) => {
@@ -197,6 +209,30 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn remove_already_runned(send_queue: &mut SendQueue, filename: &str) {
+    let Ok(file) = fs::OpenOptions::new().read(true).open(filename) else {
+        return;
+    };
+
+    let rdr = csv::Reader::from_reader(file);
+    let already_runned: BTreeSet<_> = rdr
+        .into_deserialize()
+        .filter_map(|r| match r {
+            Ok(r) => Some(r),
+            Err(e) => {
+                log::warn!("Fail on parse {e:?}");
+                None
+            }
+        })
+        .map(|r: DataRow| SendCommand {
+            destination: r.destination,
+            ttl: r.ttl,
+        })
+        .collect();
+
+    send_queue.retain(|sc| !already_runned.contains(sc))
 }
 
 fn fill_wait_queue(
@@ -360,8 +396,8 @@ fn handle_packets(packet: Ipv4Packet, wait_queue: &mut WaitQueue) -> Result<Data
         ttl: wait_cmd.ttl,
         id,
         ip: source,
-        send_at: wait_cmd.send_at,
-        received_at: now,
+        send_at: now,
+        received_at: wait_cmd.send_at,
         terminator,
     })
 }
