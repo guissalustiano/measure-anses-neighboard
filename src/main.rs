@@ -16,14 +16,15 @@ use std::{
     net::Ipv4Addr,
     str::FromStr,
     sync::mpsc,
-    thread,
+    thread::{self},
     time::{Duration, SystemTime},
 };
 
 use indicatif::ProgressBar;
 
-const MAX_PARALLEL_TRACEROUTES: usize = 32;
-const HARD_TIMEOUT: Duration = Duration::from_secs(60);
+const MAX_PARALLEL_TRACEROUTES: usize = 124;
+const HARD_TIMEOUT: Duration = Duration::from_secs(30);
+const SOFT_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_HOPS: u8 = 24;
 const FILENAME: &str = "data.csv";
 
@@ -45,7 +46,7 @@ struct WaitCommand {
 }
 type WaitQueue = VecDeque<WaitCommand>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 struct DataRow {
     destination: Ipv4Addr,
     ttl: u8,
@@ -68,8 +69,9 @@ fn setup_log() -> Result<()> {
                 message
             ))
         })
-        .level(log::LevelFilter::Info)
+        .level(log::LevelFilter::Debug)
         .chain(fern::log_file("output.log")?)
+        // .chain(std::io::stdout())
         .apply()?;
     Ok(())
 }
@@ -91,7 +93,7 @@ fn load_ips(n: usize) -> Result<Vec<Ipv4Addr>> {
 }
 
 fn generate_send_queue(ips: Vec<Ipv4Addr>) -> SendQueue {
-    (1..MAX_HOPS)
+    (1..=MAX_HOPS)
         .flat_map(|ttl| {
             ips.iter()
                 .map(move |&destination| SendCommand { destination, ttl })
@@ -108,9 +110,9 @@ fn spawn_writter(filename: &'static str) -> mpsc::Sender<DataRow> {
             .open(filename)
             .expect("Can't create a file");
 
-        if let Err(e) =
-            file.write_all(format!("destination,ttl,ip,send_at,received_at\n").as_bytes())
-        {
+        if let Err(e) = file.write_all(
+            format!("destination,ttl,ip,send_at,received_at,id,unreachable\n").as_bytes(),
+        ) {
             log::error!("Fail to write to a file: {e:?}");
         }
 
@@ -126,7 +128,6 @@ fn spawn_writter(filename: &'static str) -> mpsc::Sender<DataRow> {
                     "{},{},{},{},{},{},{}\n",
                     row.destination,
                     row.ttl,
-                    row.id,
                     row.ip,
                     row.send_at
                         .duration_since(SystemTime::UNIX_EPOCH)
@@ -136,6 +137,7 @@ fn spawn_writter(filename: &'static str) -> mpsc::Sender<DataRow> {
                         .duration_since(SystemTime::UNIX_EPOCH)
                         .unwrap_or_default()
                         .as_millis(),
+                    row.id,
                     row.terminator,
                 )
                 .as_bytes(),
@@ -150,25 +152,30 @@ fn spawn_writter(filename: &'static str) -> mpsc::Sender<DataRow> {
 fn main() -> Result<()> {
     setup_log()?;
     let writter = spawn_writter(FILENAME);
-    let (mut icmp_tx, mut icmp_rx) = icmp_transport_channel(1 << 14).unwrap();
+    let (mut icmp_tx, mut icmp_rx) = icmp_transport_channel(1 << 12).unwrap();
 
     log::info!("Shuffluing ips");
-    let ips = load_ips(1_000)?;
+    let ips = load_ips(1_000_000)?;
     log::info!("Starting queues");
     let mut send_queue = generate_send_queue(ips);
     let mut wait_queue: WaitQueue = VecDeque::with_capacity(MAX_PARALLEL_TRACEROUTES);
 
-    let pb = ProgressBar::new(send_queue.len() as u64);
+    let total_len = send_queue.len();
+    let pb = ProgressBar::new(total_len as u64);
 
     let mut packet_iter = ipv4_packet_iter(&mut icmp_rx);
     loop {
-        match packet_iter.next_with_timeout(Duration::from_millis(20))? {
+        log::info!("send: {}, wait: {}", send_queue.len(), wait_queue.len());
+        match packet_iter.next_with_timeout(Duration::from_millis(2000))? {
             Some((pkg, _)) => match handle_packets(pkg, &mut wait_queue) {
                 Ok(data) => {
                     if let Err(e) = writter.send(data) {
                         log::error!("Fail to write down received pakages: {e}");
                     }
-                    // TODO: remove packages on terminator == true
+                    if data.terminator {
+                        send_queue
+                            .retain(|q| q.destination != data.destination || q.ttl < data.ttl);
+                    }
                 }
                 Err(e) => {
                     log::error!("Fail to receive pakages: {e}");
@@ -181,7 +188,7 @@ fn main() -> Result<()> {
                 clean_wait_queue(&mut wait_queue);
 
                 let len = send_queue.len() + wait_queue.len();
-                pb.set_position(len as u64);
+                pb.set_position((total_len - len) as u64);
                 if len == 0 {
                     break;
                 }
@@ -189,7 +196,6 @@ fn main() -> Result<()> {
         }
     }
 
-    pb.finish_with_message("done");
     Ok(())
 }
 
@@ -198,7 +204,14 @@ fn fill_wait_queue(
     send_queue: &mut SendQueue,
     wait_queue: &mut WaitQueue,
 ) -> Result<()> {
-    let missing_values = MAX_PARALLEL_TRACEROUTES - wait_queue.len();
+    let deadline = SystemTime::now() - SOFT_TIMEOUT;
+    let not_delayed = wait_queue
+        .iter()
+        .filter(|w| w.send_at >= deadline)
+        .collect::<Vec<_>>()
+        .len();
+    let missing_values = MAX_PARALLEL_TRACEROUTES - not_delayed;
+    log::debug!("Sending {missing_values} new packages");
     (0..missing_values).try_for_each(|_| {
         let cmd = send_queue.front().context("Send queue is empty")?;
         let id = generate_unique_id(wait_queue)?;
@@ -272,7 +285,7 @@ fn send_echo(icmp_tx: &mut TransportSender, id: u16, cmd: SendCommand) -> Result
     icmp_packet.set_icmp_type(icmp::IcmpTypes::EchoRequest);
     icmp_packet.set_icmp_code(icmp::echo_request::IcmpCodes::NoCode);
     icmp_packet.set_identifier(id);
-    icmp_packet.set_sequence_number(id);
+    icmp_packet.set_sequence_number(2);
 
     icmp_packet.set_checksum(pnet::util::checksum(icmp_packet.packet(), 1));
 
@@ -304,13 +317,11 @@ fn handle_packets(packet: Ipv4Packet, wait_queue: &mut WaitQueue) -> Result<Data
     let source = packet.get_source();
     let packet = IcmpPacket::new(packet.payload()).context("Fail to decode to ICMP")?;
 
-    log::debug!("Received pkg from {source}");
-
     let (id, terminator) = match packet.get_icmp_type() {
         icmp::IcmpTypes::EchoReply => {
             let packet = icmp::echo_reply::EchoReplyPacket::new(packet.packet())
                 .context("Fail to parce Icmp Echo Reply")?;
-            (packet.get_identifier(), false)
+            (packet.get_identifier(), true)
         }
         icmp::IcmpTypes::TimeExceeded => {
             let packet = icmp::time_exceeded::TimeExceededPacket::new(packet.packet())
@@ -318,7 +329,7 @@ fn handle_packets(packet: Ipv4Packet, wait_queue: &mut WaitQueue) -> Result<Data
 
             let packet = ipv4::Ipv4Packet::new(packet.payload())
                 .context("Fail to parce Icmp Time Exceeded")?;
-            (packet.get_identification(), true)
+            (packet.get_identification(), false)
         }
         icmp::IcmpTypes::DestinationUnreachable => {
             let packet =
@@ -330,15 +341,19 @@ fn handle_packets(packet: Ipv4Packet, wait_queue: &mut WaitQueue) -> Result<Data
 
             (packet.get_identification(), true)
         }
-        _ => {
-            bail!("Invalid ICMP Type");
+        t => {
+            bail!("Invalid ICMP Type: {t:?}");
         }
     };
+    log::debug!("Received pkg from {source} with id {id}");
 
-    let wait_cmd = wait_queue
+    let wait_cmd_index = wait_queue
         .iter()
-        .find(|w| w.id == id)
+        .position(|w| w.id == id)
         .context("Package not found")?;
+
+    let wait_cmd = wait_queue.get(wait_cmd_index).copied().context("wft?")?;
+    wait_queue.remove(wait_cmd_index);
 
     Ok(DataRow {
         destination: wait_cmd.destination,
