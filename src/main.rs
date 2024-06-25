@@ -20,6 +20,9 @@ use std::{
     time::{Duration, SystemTime},
 };
 
+use rand_pcg::Pcg64;
+use rand_seeder::Seeder;
+
 use indicatif::ProgressBar;
 
 const MAX_PARALLEL_TRACEROUTES: usize = 128;
@@ -28,6 +31,7 @@ const SOFT_TIMEOUT: Duration = Duration::from_secs(1);
 const MIN_TIME_BETWEEN_PACKAGES: Duration = Duration::from_secs(30);
 const MAX_HOPS: u8 = 24;
 const FILENAME: &str = "data.csv";
+const SEED: u16 = 404;
 
 // SendCommand -> WaitCommand -> DataRecord
 // send_queue -> wait_queue -> write
@@ -82,9 +86,8 @@ fn setup_log() -> Result<()> {
 
 fn load_ips() -> Result<Vec<Ipv4Addr>> {
     use rand::seq::SliceRandom;
-    use rand::thread_rng;
 
-    let mut rng = thread_rng();
+    let mut rng: Pcg64 = Seeder::from(SEED).make_rng();
     let mut ips = include_str!("ips.csv")
         .lines()
         .map(Ipv4Addr::from_str)
@@ -266,14 +269,12 @@ fn clean_wait_queue(wait_queue: &mut WaitQueue) {
 }
 
 fn generate_unique_id(wait_queue: &VecDeque<WaitCommand>) -> Result<u16> {
-    use rand::thread_rng;
-
     let id = wait_queue
         .iter()
         .max_by_key(|w| w.send_at)
         .map(|w| w.id + 1)
         .unwrap_or_else(|| {
-            let mut rng = thread_rng();
+            let mut rng: Pcg64 = Seeder::from(SEED).make_rng();
             rng.gen()
         });
 
