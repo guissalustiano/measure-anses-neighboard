@@ -28,7 +28,6 @@ use indicatif::ProgressBar;
 const MAX_PARALLEL_TRACEROUTES: usize = 128;
 const HARD_TIMEOUT: Duration = Duration::from_secs(30);
 const SOFT_TIMEOUT: Duration = Duration::from_secs(1);
-const MIN_TIME_BETWEEN_PACKAGES: Duration = Duration::from_secs(30);
 const MAX_HOPS: u8 = 24;
 const FILENAME: &str = "data.csv";
 const SEED: u16 = 404;
@@ -100,9 +99,7 @@ fn load_ips() -> Result<Vec<Ipv4Addr>> {
 
 // generate batchs of commands
 fn generate_send_queue(ips: Vec<Ipv4Addr>) -> SendQueue {
-    let ratio = MIN_TIME_BETWEEN_PACKAGES.as_millis() / SOFT_TIMEOUT.as_millis();
-    log::info!("{ratio}");
-    ips.chunks(MAX_PARALLEL_TRACEROUTES * ratio as usize)
+    ips.chunks(MAX_PARALLEL_TRACEROUTES * 4096)
         .flat_map(|ip_windows| {
             (1..=MAX_HOPS).flat_map(|ttl| {
                 ip_windows
