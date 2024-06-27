@@ -6,3 +6,4 @@ flake.nix
 flake.lock
 *.csv
 output.txt
+data
